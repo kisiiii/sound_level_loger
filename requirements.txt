@@ -4,3 +4,4 @@ numpy>=1.24
 plotly>=5.20
 requests>=2.31
 python-dotenv>=1.0
+tzdata>=2024.1; sys_platform == "win32"

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, datetime, timedelta
+from datetime import time as dtime
+from pathlib import Path
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -24,7 +28,33 @@ RESAMPLE_RULES = {"生データ": None, "1分": "1min", "5分": "5min",
 
 MAX_ROWS = 100_000
 
-st.set_page_config(page_title="音環境モニター", page_icon="🔊", layout="wide")
+# 時系列グラフの表示時間帯(この範囲外は軸から畳む)
+DISPLAY_HOURS = (6, 22)
+
+# 「当日」は日本時間で判定する(DB の datetime も JST 前提)
+JST = ZoneInfo("Asia/Tokyo")
+
+st.set_page_config(page_title="音環境モニター", page_icon="🔊", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+# デバイス名の保存先(環境変数で変更可)
+NAMES_FILE = Path(os.environ.get("DEVICE_NAMES_FILE", "device_names.json"))
+
+
+def load_names() -> dict[str, str]:
+    try:
+        data = json.loads(NAMES_FILE.read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in data.items() if str(v).strip()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_names(names: dict[str, str]) -> None:
+    try:
+        NAMES_FILE.write_text(json.dumps(names, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+    except OSError as e:
+        st.sidebar.warning(f"デバイス名を保存できませんでした: {e}")
 
 
 # ------------------------------------------------------------------- D1 API
@@ -32,7 +62,7 @@ class D1Error(RuntimeError):
     pass
 
 
-def _extract_rows(payload) -> list[dict]:
+def _extract_rows(payload) -> list[dict]: 
     """Cloudflare D1 API / 自前 Worker のどちらのレスポンス形でも行を取り出す。"""
     if isinstance(payload, list):
         return payload
@@ -176,6 +206,43 @@ with st.sidebar.expander("列の対応", expanded=False):
                            index=columns.index(_dev_default) + 1 if _dev_default else 0)
     dev_col = None if dev_col == "(なし)" else dev_col
 
+# ------------------------------------------------------------------- デバイス
+if dev_col:
+    dev_rows = run(f'SELECT DISTINCT "{dev_col}" AS device FROM "{table}" ORDER BY 1')
+    all_devices = [str(v) for v in dev_rows["device"].dropna().tolist()]
+else:
+    all_devices = ["all"]
+
+names = load_names()
+
+if dev_col:
+    st.sidebar.header("デバイス")
+    with st.sidebar.expander("名前の設定", expanded=False):
+        edited = {d: st.text_input(f"ID {d}", value=names.get(d, ""), key=f"devname_{d}",
+                                   placeholder=f"デバイス {d}").strip()
+                  for d in all_devices}
+        merged = {k: v for k, v in {**names, **edited}.items() if v}
+        if merged != names:
+            save_names(merged)
+            names = merged
+
+
+def label(dev: str) -> str:
+    """設定済みの名前、なければ ID から作った既定名。"""
+    if not dev_col:
+        return "全体"
+    return names.get(dev) or f"デバイス {dev}"
+
+
+if dev_col:
+    sel = st.sidebar.multiselect("表示するデバイス", all_devices,
+                                 default=all_devices, format_func=label)
+else:
+    sel = all_devices
+
+# 色は全デバイスに固定で割り当てる(絞り込んでも色が変わらないように)
+color_of_all = {d: i for i, d in enumerate(all_devices)}
+
 # 記録期間
 rng_df = run(f'SELECT MIN("{dt_col}") AS lo, MAX("{dt_col}") AS hi FROM "{table}"')
 lo_raw, hi_raw = (rng_df.iloc[0]["lo"], rng_df.iloc[0]["hi"]) if not rng_df.empty else (None, None)
@@ -184,23 +251,27 @@ if lo_raw is None or pd.isna(lo_raw):
     st.stop()
 min_d, max_d = pd.to_datetime(lo_raw).date(), pd.to_datetime(hi_raw).date()
 
+today = datetime.now(JST).date()          # 日本時間の「当日」
+cal_min, cal_max = min(min_d, today), max(max_d, today)
+
 st.sidebar.header("期間")
 mode = st.sidebar.radio("指定方法", ["単日", "期間"], horizontal=True)
 if mode == "単日":
-    d = st.sidebar.date_input("日付", value=max_d, min_value=min_d, max_value=max_d)
+    d = st.sidebar.date_input("日付", value=today, min_value=cal_min, max_value=cal_max)
     start_d = end_d = d
 else:
-    default_start = max(min_d, max_d - timedelta(days=6))
-    rng = st.sidebar.date_input("開始 – 終了", value=(default_start, max_d),
-                                min_value=min_d, max_value=max_d)
+    default_start = max(cal_min, today - timedelta(days=6))
+    rng = st.sidebar.date_input("開始 – 終了", value=(default_start, today),
+                                min_value=cal_min, max_value=cal_max)
     if isinstance(rng, tuple) and len(rng) == 2:
         start_d, end_d = rng
     else:
-        start_d = end_d = rng if isinstance(rng, date) else max_d
+        start_d = end_d = rng if isinstance(rng, date) else today
 st.sidebar.caption(f"記録期間: {min_d} 〜 {max_d}")
+st.sidebar.caption(f"当日 (JST): {today}")
 
 st.sidebar.header("表示")
-agg_label = st.sidebar.select_slider("集計単位", list(RESAMPLE_RULES), value="生データ")
+agg_label = st.sidebar.select_slider("集計単位", list(RESAMPLE_RULES), value="10分")
 rule = RESAMPLE_RULES[agg_label]
 theme = st.sidebar.radio("テーマ", ["ライト", "ダーク"], horizontal=True)
 dark = theme == "ダーク"
@@ -222,12 +293,9 @@ raw = run(f'SELECT {", ".join(sel_cols)} FROM "{table}" '
           f'WHERE "{dt_col}" >= ? AND "{dt_col}" < ? '
           f'ORDER BY "{dt_col}" LIMIT {MAX_ROWS}', (lo_s, hi_s))
 
-st.title("🔊 音環境モニター")
-period = f"{start_d}" if start_d == end_d else f"{start_d} 〜 {end_d}"
-st.caption(f"`{table}` / {period}")
-
 if raw.empty:
-    st.info("指定した期間にデータがありません。")
+    st.info(f"指定した期間（{start_d} 〜 {end_d}）にデータがありません。"
+            f"最新の記録は {hi_raw} です。")
     st.stop()
 
 df = raw.copy()
@@ -241,16 +309,18 @@ df["device"] = df["device"].astype(str)
 if len(raw) >= MAX_ROWS:
     st.warning(f"取得件数が上限 {MAX_ROWS:,} 件に達しました。期間を短くするか集計単位を粗くしてください。")
 
-devices = sorted(df["device"].unique(), key=lambda x: (len(x), x))
 if dev_col:
-    sel = st.sidebar.multiselect("デバイス", devices, default=devices)
     if not sel:
         st.info("デバイスを 1 つ以上選択してください。")
         st.stop()
     df = df[df["device"].isin(sel)]
-    devices = [d for d in devices if d in sel]
+    if df.empty:
+        st.info("選択したデバイスのデータが期間内にありません。")
+        st.stop()
 
-color_of = {d: palette[i % len(palette)] for i, d in enumerate(devices)}
+present = set(df["device"])
+devices = [d for d in all_devices if d in present]
+color_of = {d: palette[color_of_all.get(d, i) % len(palette)] for i, d in enumerate(devices)}
 
 # ------------------------------------------------------------------ 指標タイル
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -258,7 +328,7 @@ c1.metric("LAeq", f"{energy_mean(df['laeq']):.1f} dB")
 c2.metric("LAmax", f"{df['laeq'].max():.1f} dB")
 c3.metric("L5", f"{percentile_level(df['laeq'], 5):.1f} dB")
 c4.metric("L50", f"{percentile_level(df['laeq'], 50):.1f} dB")
-c5.metric("件数", f"{len(df):,}")
+c5.metric("L95", f"{percentile_level(df['laeq'], 95):.1f} dB")
 
 # ---------------------------------------------------------------- 時系列
 plot_df = resample_leq(df, rule) if rule else df[["dt", "device", "laeq"]]
@@ -269,12 +339,13 @@ for d in devices:
     if sub.empty:
         continue
     fig.add_trace(go.Scatter(
-        x=sub["dt"], y=sub["laeq"], name=str(d),
+        x=sub["dt"], y=sub["laeq"], name=label(d),
         mode="lines+markers" if len(sub) < 200 else "lines",
         line=dict(color=color_of[d], width=2),
         marker=dict(size=8, color=color_of[d]),
-        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y:.1f} dB<extra>" + str(d) + "</extra>",
+        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y:.1f} dB<extra>" + label(d) + "</extra>",
     ))
+hour_lo, hour_hi = DISPLAY_HOURS
 fig.update_layout(
     template=template, height=420, hovermode="x unified",
     margin=dict(l=8, r=8, t=44, b=8),
@@ -283,43 +354,32 @@ fig.update_layout(
     legend=dict(orientation="h", y=1.12, x=0, title=None),
     yaxis=dict(title="LAeq [dB]", gridcolor=grid, zeroline=False),
     xaxis=dict(title=None, gridcolor=grid, showspikes=True, spikemode="across",
-               spikethickness=1, spikedash="dot"),
+               spikethickness=1, spikedash="dot",
+               # 夜間(hour_hi〜翌 hour_lo)を軸から畳んで 6:00–22:00 だけ並べる
+               rangebreaks=[dict(bounds=[hour_hi, hour_lo], pattern="hour")],
+               range=[datetime.combine(start_d, dtime(hour_lo)),
+                      datetime.combine(end_d, dtime(hour_hi))]),
 )
 st.plotly_chart(fig, width="stretch")
 
-# ------------------------------------------------- 時間帯別 + デバイス別サマリ
-left, right = st.columns(2)
-
-hourly = (df.assign(hour=df["dt"].dt.hour)
-            .groupby(["device", "hour"])["laeq"].agg(energy_mean).reset_index())
-fh = go.Figure()
-for d in devices:
-    sub = hourly[hourly["device"] == d]
-    fh.add_trace(go.Bar(x=sub["hour"], y=sub["laeq"], name=str(d),
-                        marker=dict(color=color_of[d]),
-                        hovertemplate="%{x}時<br>%{y:.1f} dB<extra>" + str(d) + "</extra>"))
-fh.update_layout(template=template, height=340, barmode="group", bargap=0.25,
-                 margin=dict(l=8, r=8, t=44, b=8), title="時間帯別",
-                 showlegend=len(devices) >= 2,
-                 legend=dict(orientation="h", y=1.15, x=0, title=None),
-                 xaxis=dict(title="時刻", dtick=2, gridcolor="rgba(0,0,0,0)"),
-                 yaxis=dict(title="LAeq [dB]", gridcolor=grid, zeroline=False))
-left.plotly_chart(fh, width="stretch")
-
+# ------------------------------------------------------------ デバイス別サマリ
 stats = (df.groupby("device")["laeq"]
            .agg(LAeq=energy_mean, LAmax="max", LAmin="min",
                 L5=lambda s: percentile_level(s, 5),
                 L50=lambda s: percentile_level(s, 50),
                 L95=lambda s: percentile_level(s, 95),
-                件数="count")
+                データ数="count")
            .round(1)
-           .reindex(devices))
-right.markdown("**デバイス別サマリ**")
-right.dataframe(stats, width="stretch")
+           .reindex(devices)
+           .rename(index=label)
+           .rename_axis("デバイス"))
+st.markdown("**デバイス別サマリ**")
+st.dataframe(stats, width="stretch")
 
 # ------------------------------------------------------------------ データ表
 with st.expander(f"データ表示（{len(df):,} 件）"):
-    view = df.rename(columns={"dt": "日時", "laeq": "LAeq [dB]", "device": "デバイス"})
+    view = df.assign(device=df["device"].map(label)) \
+             .rename(columns={"dt": "日時", "laeq": "LAeq [dB]", "device": "デバイス"})
     if not dev_col:
         view = view.drop(columns=["デバイス"])
     st.dataframe(view, width="stretch", height=360)
